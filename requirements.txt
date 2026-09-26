@@ -1,5 +1,13 @@
-openai>=1.0.0
-colorama>=0.4.6
-pwinput>=1.0.3
-python-dotenv>=1.0.0
-rich>=13.3.5
+# Runtime dependencies for HexSecGPT
+openai>=1.0.0,<2.0.0
+colorama>=0.4.6,<0.5.0
+pwinput>=1.0.3,<2.0.0
+python-dotenv>=1.0.0,<2.0.0
+rich>=13.3.5,<15.0.0
+
+# Used only by upgrademanger.py (optional CLI, not needed to chat)
+requests>=2.31.0,<3.0.0
+packaging>=23.0,<26.0
+
+# Only if you set git_enabled=true in upgrade_config.json
+# GitPython>=3.1.40,<4.0.0

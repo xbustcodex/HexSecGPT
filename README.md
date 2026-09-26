@@ -79,7 +79,7 @@ Access to our private model is exclusive. To inquire about services and pricing,
 - **Powerful AI Conversations:** Get intelligent and context-aware answers to your queries.
 - **Unrestricted Framework:** A system prompt designed to bypass conventional AI limitations.
 - **Easy-to-Use CLI:** A clean and simple command-line interface for smooth interaction.
-- **Cross-Platform:** Tested and working on Kali Linux, Ubuntu, and Termux.
+- **Cross-Platform:** Runs on Windows, Linux, macOS and Termux.
 
 ---
 
@@ -109,7 +109,7 @@ We provide simple, one-command installation scripts for your convenience.
 1. Open your terminal.
 2. Run the following command. It will download the installer, make it executable, and run it for you.
    ```bash
-   bash <(curl -s https://raw.githubusercontent.com/hexsecteam/HexSecGPT/main/install.sh)
+   bash <(curl -s https://raw.githubusercontent.com/xbustcodex/HexSecGPT/main/install.sh)
    ```
 
 <details>
@@ -119,7 +119,7 @@ If you prefer to install manually, follow these steps.
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/hexsecteam/HexSecGPT.git
+    git clone https://github.com/xbustcodex/HexSecGPT.git
     ```
 2.  **Navigate to the directory:**
     ```bash
@@ -148,6 +148,60 @@ You can easily switch between API providers.
     API_PROVIDER = "openrouter" 
     ```
 4. Save the file. The script will now use the selected provider's API.
+
+---
+
+## :lock: Security
+
+### Your API key
+
+The key is stored in a `.HexSec` file in the project directory. This file is
+listed in `.gitignore` and **must never be committed**. If you ever share this
+folder, a screenshot, or a zip of it — rotate the key at your provider first.
+
+On Linux/macOS you can restrict it further:
+
+```bash
+chmod 600 .HexSec
+```
+
+### The self-upgrade manager
+
+`upgrademanger.py` is **off by default** and stays disabled until you configure
+it. It refuses to install anything it cannot authenticate.
+
+| Protection | Behaviour |
+|---|---|
+| `signature_key` empty | Downloads are refused entirely |
+| `update_server` not `https://` | Refused |
+| HMAC-SHA256 mismatch | Package rejected, nothing written |
+| Manifest path escaping the project | Rejected before any write |
+| Zip/tar traversal, links, symlinks | Rejected |
+| Hash mismatch on a file | File not written |
+| `monitor` command | Reports updates only, never installs unattended |
+
+To enable it, set both values in `upgrade_config.json`:
+
+```json
+{
+    "update_server": "https://your-domain.example/upgrades",
+    "signature_key": "a-long-random-secret"
+}
+```
+
+Packages must be served as `<version>.zip` with a detached HMAC-SHA256 signature
+at `<version>.zip.sig`, generated with that same key:
+
+```bash
+python -c "import hmac,sys;print(hmac.new(sys.argv[2].encode(),open(sys.argv[1],'rb').read(),'sha256').hexdigest())" pkg.zip "$SIGNATURE_KEY" > pkg.zip.sig
+```
+
+```bash
+python upgrademanger.py     # then: status / upgrade / rollback / monitor
+```
+
+Backups are written to `.upgrade_backups/` and exclude `.HexSec`, `.env` and
+key material, so your credentials are never duplicated into them.
 ---
 ## 📽️ Demo Setup
 
@@ -155,43 +209,87 @@ You can easily switch between API providers.
 [https://www.youtube.com/watch?v=EM08JC4Mv6c](https://www.youtube.com/watch?v=EM08JC4Mv6c)
 ## :eyes: Usage
 
-Once installation and configuration are complete, run the application with this simple command:
-
 ```bash
 python3 HexSecGPT.py
 ```
 
-The first time you run it, you will be prompted to enter your API key. It will be saved locally for future sessions.
+The first time you run it, you will be prompted to enter your API key. It is saved
+to `.HexSec` (gitignored) and reused on later runs.
+
+### Command-line options
+
+| Flag | Effect |
+|---|---|
+| `--list-models` | List the currently-free OpenRouter models and exit |
+| `--model <id>` | Pin a specific model for this run |
+| `--provider openrouter\|deepseek` | Override the provider for this run |
+| `--upgrade [version]` | Run the upgrade manager before starting |
+
+```bash
+python HexSecGPT.py --list-models
+python HexSecGPT.py --model nvidia/nemotron-3-ultra-550b-a55b:free
+python HexSecGPT.py --provider deepseek
+```
+
+
+## 🔄 Model Compatibility (OpenRouter)
+
+Free models on OpenRouter are retired and rate-limited constantly. HexSecGPT
+therefore **resolves a working model at runtime** instead of hard-coding a name:
+
+1. `MODEL_NAME` is set to `auto`. On startup the app queries the OpenRouter
+   catalogue and picks a free, chat-capable model.
+2. The catalogue is cached to `.model_cache.json` for an hour, so an offline
+   start still works from the last known-good list.
+3. If a model 404s, is rate-limited, or has no live endpoint mid-chat, the app
+   switches to another free model and tells you it did so.
+4. If your pinned model has been retired, the pin is discarded rather than
+   failing — a dead model name is never fatal.
+
+### Checking the free tier
+
+```bash
+python SeeOpenRouterFreeModels.py            # human-readable, with context sizes
+python SeeOpenRouterFreeModels.py --json     # machine-readable
+python SeeOpenRouterFreeModels.py --refresh  # bypass the cache
+```
+
+No API key is required: the public `/models` endpoint is open, so discovery works
+before you have configured a key.
+
+### Pinning a model
+
+Resolution order is `--model` → `HEXSEC_MODEL` → `HEXSEC_MODEL` in `.HexSec` →
+best available free model.
+
+```bash
+# one-off
+python HexSecGPT.py --model qwen/qwen3.8-27b:free
+
+# persistent
+export HEXSEC_MODEL=qwen/qwen3.8-27b:free
+```
+
+To pin a model permanently in code, set `Config.PROVIDERS["openrouter"]["MODEL_NAME"]`
+to a concrete id instead of `Config.AUTO_MODEL`.
+
+> ⚠️ Free models are best-effort. They can be disabled, rate-limited or removed
+> without notice, and OpenRouter enforces its own content policy server-side
+> regardless of the system prompt. Pin a specific model if you need repeatable
+> behaviour.
 
 ---
 
-## 🔄 Model Compatibility & Troubleshooting (OpenRouter)
+## :test: Tests
 
-Some OpenRouter models may become unavailable, restricted, or stop working over time.
+```bash
+python -m unittest test_hexsec -v
+```
 
-To handle this, the repository includes a model discovery script that helps you identify which FREE OpenRouter models are currently available.
+The suite is offline and deterministic: model resolution, chat-model filtering,
+runtime model fallback and every self-upgrade guard (path containment, signature
+verification, secret-excluding backups, rollback integrity) are covered.
 
-### ⚠️ If the AI chat is not working
-
-1. Open the SeeOpenRouterFreeModels.py script included in the repository  
-2. Insert your own OpenRouter API key into the script  
-3. Run the script python SeeOpenRouterFreeModels.py
-4. The script will list all currently available FREE models  
-5. Choose one of the working models from the output  
-
-### 🔧 Update the provider configuration
-
-- Navigate to the provider file in the source code HexSecGPT.py
-- Replace the existing model name with one of the working free models  
-
-![Provider model configuration example](img/provider-model-example.jpg)
-
-- Save the file and restart the application  
-
-> ⚠️ Note: Some free models may not work correctly or may be temporarily disabled by OpenRouter.  
-> If a model fails, simply try another one from the list.
-
-This method ensures better compatibility and keeps the project functional even when OpenRouter updates, limits, or removes models.
 
 
 

@@ -39,7 +39,7 @@ if [ -d "HexSecGPT" ]; then
     echo "[!] HexSecGPT directory already exists. Skipping clone."
 else
     echo "[+] Cloning HexSecGPT repository..."
-    git clone https://github.com/hexsecteam/HexSecGPT.git
+    git clone https://github.com/xbustcodex/HexSecGPT.git
 fi
 
 cd HexSecGPT

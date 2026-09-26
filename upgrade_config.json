@@ -1,0 +1,44 @@
+{
+    "version_file": "version.json",
+    "update_server": "",
+    "backup_enabled": true,
+    "parallel_processing": true,
+    "max_workers": 4,
+    "exclude_patterns": [
+        ".git",
+        "__pycache__",
+        "*.pyc",
+        ".env",
+        ".env.*",
+        "venv",
+        ".HexSec",
+        "*.key",
+        "*.pem",
+        "*.pfx",
+        ".upgrade_backups"
+    ],
+    "version_pattern": "v(\\d+)\\.(\\d+)\\.(\\d+)",
+    "incremental_updates": true,
+    "rollback_enabled": true,
+    "max_backups": 5,
+    "file_types": [
+        ".py",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".txt",
+        ".md",
+        ".ini",
+        ".cfg"
+    ],
+    "critical_folders": [
+        "src",
+        "lib",
+        "core",
+        "main"
+    ],
+    "auto_commit": false,
+    "git_enabled": false,
+    "signature_key": "",
+    "require_https": true
+}
