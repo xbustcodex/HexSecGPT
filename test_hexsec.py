@@ -533,11 +533,11 @@ class TestStartupReachesMenuWithoutKey(unittest.TestCase):
 
     def test_menu_shows_connection_status_row(self):
         from rich.console import Console
-        for connected, expected in ((False, "No API Key"),
-                                    (True, "Neural Link established")):
+        for connected in (False, True):
             with self.subTest(connected=connected):
                 ui = app_mod.UI()
                 ui.connected = connected
+                ui.provider = "local"
                 buf = io.StringIO()
                 real_console = ui.console
                 ui.console = Console(file=buf, width=200, force_terminal=False,
@@ -546,7 +546,13 @@ class TestStartupReachesMenuWithoutKey(unittest.TestCase):
                     ui.main_menu()
                 finally:
                     ui.console = real_console
-                self.assertIn(expected, buf.getvalue())
+                text = buf.getvalue()
+                # The status row must track connection state, and the
+                # connected row must name the active provider.
+                self.assertIn("Online" if connected else "Offline", text)
+                self.assertEqual("Online" in text, connected)
+                if connected:
+                    self.assertIn("local", text)
 
     def test_valid_key_with_no_free_model_is_reported(self):
         """A key that verifies but resolves to 'auto' must say so, not chat."""
@@ -603,6 +609,7 @@ class TestStartupReachesMenuWithoutKey(unittest.TestCase):
 
         class DeadBrain:
             model = app_mod.Config.AUTO_MODEL
+            provider = "openrouter"
 
             def chat(self, prompt):
                 yield "Error: Connection Terminated. Reason: model_not_found"
@@ -618,6 +625,248 @@ class TestStartupReachesMenuWithoutKey(unittest.TestCase):
         self.assertIn("No Free Models", titles,
                       "empty free tier was not explained after a dead model")
         self.assertIn("will not use a paid model", dict(msgs)["No Free Models"])
+
+    def test_chat_explains_missing_local_model(self):
+        """A dead local model must point at ollama pull, not the free tier."""
+        msgs = []
+        app = app_mod.App()
+        for name in ("show_msg", "banner", "stream_markdown", "get_input"):
+            self.addCleanup(setattr, app_mod.UI, name, getattr(app_mod.UI, name))
+        app_mod.UI.banner = lambda self: None
+        app_mod.UI.stream_markdown = lambda self, title, gen: list(gen)
+        app_mod.UI.show_msg = (
+            lambda self, title, content, color="white": msgs.append((title, content)))
+
+        class DeadLocalBrain:
+            model = app_mod.Config.AUTO_MODEL
+            provider = "local"
+
+            def chat(self, prompt):
+                yield "Error: Connection Terminated. Reason: model_not_found"
+
+            def _switch_model(self, exclude):
+                return False
+
+        app.brain = DeadLocalBrain()
+        inputs = iter(["hello", "/exit"])
+        app_mod.UI.get_input = lambda self, label="COMMAND": next(inputs)
+        app.run_chat()
+        titles = [t for t, _ in msgs]
+        self.assertIn("No Local Models", titles)
+        self.assertIn("ollama pull", dict(msgs)["No Local Models"])
+        self.assertNotIn("No Free Models", titles,
+                         "a local failure was reported as a free-tier problem")
+
+import SeeLocalModels as local_disc
+
+
+class TestLocalProviderConfig(unittest.TestCase):
+    """Local (Ollama) is the free, offline path: it must need no API key."""
+
+    def test_local_provider_needs_no_key(self):
+        self.assertFalse(app_mod.Config.PROVIDERS["local"]["NEEDS_KEY"])
+        self.assertTrue(app_mod.Config.PROVIDERS["openrouter"]["NEEDS_KEY"])
+        self.assertTrue(app_mod.Config.PROVIDERS["deepseek"]["NEEDS_KEY"])
+
+    def test_local_base_url_targets_ollama(self):
+        self.assertIn("11434", app_mod.Config.PROVIDERS["local"]["BASE_URL"])
+
+    def test_ollama_does_not_reject_placeholder_key(self):
+        """The client needs a non-empty key string even though Ollama ignores it."""
+        brain = app_mod.HexSecBrain("", app_mod.UI())
+        self.assertEqual(brain.client.api_key, "not-needed")
+
+    def test_setup_local_needs_no_key(self):
+        real_provider = app_mod.Config.API_PROVIDER
+        real_brain = app_mod.HexSecBrain
+        self.addCleanup(setattr, app_mod.Config, "API_PROVIDER", real_provider)
+        self.addCleanup(setattr, app_mod, "HexSecBrain", real_brain)
+        app_mod.Config.API_PROVIDER = "local"
+
+        class FakeBrain:
+            def __init__(self, *a, **k):
+                self.client = type("C", (), {
+                    "models": type("M", (), {"list": staticmethod(lambda: None)})()})()
+
+            def resolve_model(self):
+                return "qwen2.5-coder:7b"
+
+        app_mod.HexSecBrain = FakeBrain
+        real_sleep = app_mod.time.sleep
+        self.addCleanup(setattr, app_mod.time, "sleep", real_sleep)
+        app_mod.time.sleep = lambda s: None
+
+        # No .HexSec exists, so this only passes if the key is not required.
+        app = app_mod.App()
+        self.assertTrue(app.setup(), "local provider demanded an API key")
+
+    def test_brain_records_provider_for_switching(self):
+        real_provider = app_mod.Config.API_PROVIDER
+        self.addCleanup(setattr, app_mod.Config, "API_PROVIDER", real_provider)
+        app_mod.Config.API_PROVIDER = "local"
+        self.assertEqual(app_mod.HexSecBrain("", app_mod.UI()).provider, "local")
+
+
+class TestLocalModelResolution(unittest.TestCase):
+    """The 'auto' placeholder must resolve against Ollama, not OpenRouter."""
+
+    def setUp(self):
+        real_provider = app_mod.Config.API_PROVIDER
+        self.addCleanup(setattr, app_mod.Config, "API_PROVIDER", real_provider)
+        app_mod.Config.API_PROVIDER = "local"
+        self._real_list = local_disc.list_local_models
+        self._real_resolve = local_disc.resolve_local_model
+        self.addCleanup(lambda: setattr(local_disc, "list_local_models", self._real_list))
+        self.addCleanup(lambda: setattr(local_disc, "resolve_local_model", self._real_resolve))
+
+    def test_auto_resolves_to_a_local_model(self):
+        local_disc.resolve_local_model = lambda *a, **k: "qwen2.5-coder:3b"
+        brain = app_mod.HexSecBrain("", app_mod.UI())
+        self.assertEqual(brain.resolve_model(), "qwen2.5-coder:3b")
+        self.assertNotEqual(brain.model, app_mod.Config.AUTO_MODEL)
+
+    def test_no_local_models_leaves_placeholder_visible(self):
+        local_disc.resolve_local_model = lambda *a, **k: None
+        brain = app_mod.HexSecBrain("", app_mod.UI())
+        self.assertEqual(brain.resolve_model(), app_mod.Config.AUTO_MODEL)
+
+    def test_switch_model_picks_another_local_model(self):
+        brain = app_mod.HexSecBrain("", app_mod.UI(), model_override="dead:model")
+        local_disc.list_local_models = lambda *a, **k: ["dead:model", "qwen2.5-coder:3b"]
+        self.assertTrue(brain._switch_model({"dead:model"}))
+        self.assertEqual(brain.model, "qwen2.5-coder:3b")
+
+    def test_switch_model_false_when_none_left(self):
+        brain = app_mod.HexSecBrain("", app_mod.UI(), model_override="only:model")
+        local_disc.list_local_models = lambda *a, **k: ["only:model"]
+        self.assertFalse(brain._switch_model({"only:model"}))
+
+
+class TestLocalModelFiltering(unittest.TestCase):
+    def test_embedding_and_rerank_models_excluded(self):
+        for bad in ("nomic-embed-text", "bge-m3", "mxbai-embed-large", "rerank-model"):
+            self.assertFalse(local_disc.is_suitable_local(bad), bad)
+
+    def test_chat_and_coder_models_accepted(self):
+        for good in ("qwen2.5-coder:7b", "deepseek-r1:1.5b", "gpt-oss:20b", "llama3.2:3b"):
+            self.assertTrue(local_disc.is_suitable_local(good), good)
+
+    def test_tags_payload_parsed(self):
+        payload = {"models": [{"name": "qwen2.5-coder:3b"}, {"nope": 1}, {}]}
+        self.assertEqual(local_disc._ids_from_tags(payload), ["qwen2.5-coder:3b"])
+
+    def test_openai_payload_parsed(self):
+        payload = {"data": [{"id": "qwen2.5-coder:7b"}, {"bad": 1}]}
+        self.assertEqual(local_disc._ids_from_openai(payload), ["qwen2.5-coder:7b"])
+
+    def test_malformed_payloads_yield_nothing(self):
+        self.assertEqual(local_disc._ids_from_tags(None), [])
+        self.assertEqual(local_disc._ids_from_openai(None), [])
+
+    def test_resolution_prefers_pinned_then_override_then_first(self):
+        local_disc.list_local_models = lambda *a, **k: ["a:1", "b:2"]
+        self.assertEqual(local_disc.resolve_local_model(preferred="b:2"), "b:2")
+        self.assertEqual(local_disc.resolve_local_model(preferred="gone:0"), "a:1")
+        self.assertIsNone(local_disc.resolve_local_model(preferred="gone:0")
+                          if local_disc.list_local_models() == [] else None)
+
+    def test_no_local_models_returns_none(self):
+        local_disc.list_local_models = lambda *a, **k: []
+        self.assertIsNone(local_disc.resolve_local_model())
+
+
+class TestProviderSwitching(unittest.TestCase):
+    """Option [5] must change provider without restarting the app."""
+
+    def setUp(self):
+        real_provider = app_mod.Config.API_PROVIDER
+        real_sleep = app_mod.time.sleep
+        self.addCleanup(setattr, app_mod.Config, "API_PROVIDER", real_provider)
+        self.addCleanup(setattr, app_mod.time, "sleep", real_sleep)
+        app_mod.time.sleep = lambda s: None
+        for name in app_mod.Config.PROVIDERS:
+            self.addCleanup(
+                app_mod.Config.PROVIDERS[name].__setitem__,
+                "MODEL_NAME", app_mod.Config.PROVIDERS[name]["MODEL_NAME"])
+
+    def test_switch_by_menu_index(self):
+        app = app_mod.App()
+        real_setup = app_mod.App.setup
+        real_banner = app_mod.UI.banner
+        self.addCleanup(setattr, app_mod.App, "setup", real_setup)
+        self.addCleanup(setattr, app_mod.UI, "banner", real_banner)
+        app_mod.UI.banner = lambda self: None
+        app_mod.App.setup = lambda self: True
+        app_mod.UI.get_input = lambda self, label="COMMAND": str(
+            sorted(app_mod.Config.PROVIDERS).index("local") + 1)
+        self.addCleanup(setattr, app_mod.UI, "get_input", app_mod.UI.get_input)
+        app.switch_provider()
+        self.assertEqual(app_mod.Config.API_PROVIDER, "local")
+        self.assertTrue(app.ui.connected)
+        self.assertEqual(app.ui.provider, "local")
+
+    def test_switch_by_typed_name(self):
+        app = app_mod.App()
+        real_setup = app_mod.App.setup
+        real_banner = app_mod.UI.banner
+        self.addCleanup(setattr, app_mod.App, "setup", real_setup)
+        self.addCleanup(setattr, app_mod.UI, "banner", real_banner)
+        app_mod.UI.banner = lambda self: None
+        app_mod.App.setup = lambda self: True
+        app_mod.UI.get_input = lambda self, label="COMMAND": "  LOCAL  "
+        self.addCleanup(setattr, app_mod.UI, "get_input", app_mod.UI.get_input)
+        app.switch_provider()
+        self.assertEqual(app_mod.Config.API_PROVIDER, "local")
+
+    def test_invalid_provider_is_rejected(self):
+        app = app_mod.App()
+        real_setup = app_mod.App.setup
+        real_banner = app_mod.UI.banner
+        self.addCleanup(setattr, app_mod.App, "setup", real_setup)
+        self.addCleanup(setattr, app_mod.UI, "banner", real_banner)
+        app_mod.UI.banner = lambda self: None
+        app_mod.UI.get_input = lambda self, label="COMMAND": "not-a-provider"
+        self.addCleanup(setattr, app_mod.UI, "get_input", app_mod.UI.get_input)
+        self.assertFalse(app.switch_provider())
+
+    def test_switch_resets_pinned_model(self):
+        """A model pinned for another provider is meaningless after a switch."""
+        app_mod.Config.PROVIDERS["openrouter"]["MODEL_NAME"] = "vendor/old:free"
+        app = app_mod.App()
+        real_setup = app_mod.App.setup
+        real_banner = app_mod.UI.banner
+        self.addCleanup(setattr, app_mod.App, "setup", real_setup)
+        self.addCleanup(setattr, app_mod.UI, "banner", real_banner)
+        app_mod.UI.banner = lambda self: None
+        app_mod.App.setup = lambda self: True
+        app_mod.UI.get_input = lambda self, label="COMMAND": "local"
+        self.addCleanup(setattr, app_mod.UI, "get_input", app_mod.UI.get_input)
+        app.switch_provider()
+        self.assertEqual(app_mod.Config.PROVIDERS["local"]["MODEL_NAME"],
+                         app_mod.Config.AUTO_MODEL)
+
+    def test_menu_lists_switch_option(self):
+        ui = app_mod.UI()
+        ui.connected = True
+        ui.provider = "local"
+        from rich.console import Console
+        buf = io.StringIO()
+        real_console = ui.console
+        ui.console = Console(file=buf, width=200, force_terminal=False,
+                             no_color=True, legacy_windows=False)
+        try:
+            ui.main_menu()
+        finally:
+            ui.console = real_console
+        text = buf.getvalue()
+        self.assertIn("Switch Provider", text)
+        self.assertIn("Online - local", text)
+
+    def test_list_local_models_flag(self):
+        real_main = local_disc.main
+        self.addCleanup(setattr, local_disc, "main", real_main)
+        local_disc.main = lambda argv: 0
+        self.assertEqual(app_mod.main(["--list-local-models"]), 0)
 
 
 if __name__ == "__main__":

@@ -39,6 +39,7 @@ Here is a glimpse of the HexSecGPT framework in action.
 - [Getting Started](#electric_plug-getting-started)
   - [Prerequisites: API Key](#key-prerequisites-api-key)
   - [Installation](#gear-installation)
+  - [Running fully offline](#electric_plug-running-fully-offline)
 - [Configuration](#wrench-configuration)
 - [Usage](#eyes-usage)
 - [Contributing](#wave-contributing)
@@ -89,13 +90,17 @@ Follow these steps to get the HexSecGPT framework running on your system.
 
 ### :key: Prerequisites: API Key
 
-To use this framework, you **must** obtain an API key from a supported provider. These services offer free tiers that are perfect for getting started.
+**Only needed for the hosted providers.** To use `openrouter` or `deepseek` you
+**must** obtain an API key from a supported provider. These services offer free
+tiers that are perfect for getting started.
 
 1.  **Choose a provider:**
     *   **OpenRouter:** Visit [OpenRouter.ai](https://openrouter.ai/keys) to get a free API key. They provide access to a variety of models.
     *   **DeepSeek:** Visit the [DeepSeek Platform](https://platform.deepseek.com/api_keys) for a free API key to use their powerful models.
+   *   **Local (Ollama):** Needs no API key and costs nothing — see
+       [Running fully offline](#electric_plug-running-fully-offline).
 
-2.  **Copy your API key.** You will need to paste it into the script when prompted during the first run.
+2.  **Copy your API key.** You will need to paste it into the script when prompted during the first run. Skip this if you chose Local.
 
 ### :gear: Installation
 
@@ -111,6 +116,41 @@ We provide simple, one-command installation scripts for your convenience.
    ```bash
    bash <(curl -s https://raw.githubusercontent.com/xbustcodex/HexSecGPT/main/install.sh)
    ```
+
+### :electric_plug: Running fully offline
+
+With the `local` provider, HexSecGPT talks to a model running on your own
+machine through [Ollama](https://ollama.com). **No API key, no cost, no
+network.** The API key step above can be skipped entirely.
+
+1. Install Ollama and start it:
+   ```bash
+   ollama serve
+   ```
+2. Pull a model:
+   ```bash
+   ollama pull qwen2.5-coder:7b
+   ```
+3. Switch to it, from the menu with **[5]** or at launch:
+   ```bash
+   python HexSecGPT.py --provider local
+   ```
+
+See what is available locally at any time:
+
+```bash
+python HexSecGPT.py --list-local-models
+```
+
+Pin a local model with `--model <id>` or `HEXSEC_LOCAL_MODEL` in `.HexSec`.
+If Ollama is not running, the app says so and names the fix instead of
+failing silently.
+
+> **Speed:** local models run on your CPU or GPU. A small coder model such
+> as `qwen2.5-coder:3b` answers quickly; a 20B model on CPU is slow. Quality
+> also depends on the model — a 3B model is not as coherent as a hosted
+> frontier model. Use `local` for privacy and zero cost, `openrouter` for
+> capability.
 
 <details>
 <summary>Manual Installation (Alternative)</summary>
@@ -135,19 +175,32 @@ If you prefer to install manually, follow these steps.
 
 ## :wrench: Configuration
 
-You can easily switch between API providers.
+### Switching provider at runtime
 
-1.  Open the `HexSecGPT.py` file in a text editor.
-2.  Locate the `API_PROVIDER` variable at the top of the file.
-3.  Change the value to either `"openrouter"` or `"deepseek"`.
+Choose **[5] Switch Provider** from the main menu. The app switches without a
+restart, and the active provider is shown in the menu status row.
+
+### Switching provider at launch
+
+```bash
+python HexSecGPT.py --provider local
+```
+
+`local` targets Ollama and needs **no API key** — see
+[Running fully offline](#electric_plug-running-fully-offline).
+
+### Setting the default
+
+1.  Open `HexSecGPT.py` in a text editor.
+2.  Locate `API_PROVIDER` in the `Config` class.
+3.  Change it to `"local"`, `"openrouter"`, or `"deepseek"`.
 
     ```python
     # HexSecGPT.py
 
-    # Change this value to "deepseek" or "openrouter"
-    API_PROVIDER = "openrouter" 
+    API_PROVIDER = "openrouter"
     ```
-4. Save the file. The script will now use the selected provider's API.
+
 
 ---
 
@@ -221,14 +274,16 @@ to `.HexSec` (gitignored) and reused on later runs.
 | Flag | Effect |
 |---|---|
 | `--list-models` | List the currently-free OpenRouter models and exit |
+| `--list-local-models` | List the models available through Ollama and exit |
 | `--model <id>` | Pin a specific model for this run |
-| `--provider openrouter\|deepseek` | Override the provider for this run |
+| `--provider local\|openrouter\|deepseek` | Override the provider for this run |
 | `--upgrade [version]` | Run the upgrade manager before starting |
 
 ```bash
 python HexSecGPT.py --list-models
+python HexSecGPT.py --list-local-models
 python HexSecGPT.py --model nvidia/nemotron-3-ultra-550b-a55b:free
-python HexSecGPT.py --provider deepseek
+python HexSecGPT.py --provider local
 ```
 
 

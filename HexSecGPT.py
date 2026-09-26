@@ -87,16 +87,38 @@ class Config:
     # you deliberately want a fixed one.
     AUTO_MODEL = "auto"
 
+    # "local" is Ollama's OpenAI-compatible endpoint. It needs no API key
+    # and costs nothing, so it is the only provider that works fully
+    # offline. OLLAMA_HOST is read by Ollama itself, not by this app.
     PROVIDERS = {
         "openrouter": {
             "BASE_URL": "https://openrouter.ai/api/v1",
             "MODEL_NAME": AUTO_MODEL,
+            "NEEDS_KEY": True,
         },
         "deepseek": {
             "BASE_URL": "https://api.deepseek.com",
             "MODEL_NAME": "deepseek-chat",
+            "NEEDS_KEY": True,
+        },
+        "local": {
+            "BASE_URL": os.environ.get(
+                "HEXSEC_OLLAMA_URL", "http://localhost:11434/v1"
+            ),
+            # Resolved at startup against /models; the first chat model wins.
+            "MODEL_NAME": AUTO_MODEL,
+            "NEEDS_KEY": False,
         },
     }
+
+    # Ollama endpoint used to probe for local models. Separate from BASE_URL
+    # because the probe is a plain GET, not an OpenAI client call.
+    OLLAMA_TAGS_URL = os.environ.get(
+        "HEXSEC_OLLAMA_TAGS_URL", "http://localhost:11434/api/tags"
+    )
+    # A local model that cannot be reached is a model failure, so the retry
+    # path can move on instead of looping on the same dead name.
+    LOCAL_PROBE_TIMEOUT = 2.0
 
     # Change this if you want to use DeepSeek direct
     API_PROVIDER = "openrouter"
@@ -125,6 +147,8 @@ class UI:
         self.console = Console()
         # Kept in sync with App._connected; set by App.start().
         self.connected = False
+        # Shown in the menu status row so the active provider is visible.
+        self.provider = ""
     
     def clear(self):
         os.system('cls' if os.name == 'nt' else 'clear')
@@ -166,10 +190,11 @@ class UI:
         table.add_row("[2]", "Configure Security Keys (API Setup)")
         table.add_row("[3]", "System Manifesto (About)")
         table.add_row("[4]", "Terminate Session (Exit)")
+        table.add_row("[5]", "Switch Provider (Local / OpenRouter / DeepSeek)")
         if self.connected:
-            table.add_row("[*]", "[bold green]Status: Neural Link established[/]")
+            table.add_row("[*]", f"[bold green]Status: Online - {self.provider}[/]")
         else:
-            table.add_row("[*]", "[bold yellow]Status: No API Key - option [1] requires [2][/]")
+            table.add_row("[*]", "[bold yellow]Status: Offline - option [1] unavailable[/]")
         
         panel = Panel(
             Align.center(table),
@@ -279,8 +304,10 @@ Hacker Mode: ENGAGED.
             ui.show_msg("System Error", "Invalid API Provider Configuration", "red")
             sys.exit(1)
 
+        # Ollama ignores the key but the client still requires a non-empty
+        # string, so a placeholder is passed when the provider needs none.
         self.client = openai.OpenAI(
-            api_key=api_key,
+            api_key=api_key or "not-needed",
             base_url=config["BASE_URL"],
             default_headers={
                 "HTTP-Referer": "https://github.com/hexsecteam",
@@ -290,6 +317,17 @@ Hacker Mode: ENGAGED.
         self.history = [{"role": "system", "content": self.SYSTEM_PROMPT}]
         self._resolved = False
         self.model = model_override or config["MODEL_NAME"]
+        # Which provider this brain was built for; local models come from a
+        # different catalogue than OpenRouter's free tier.
+        self.provider = Config.API_PROVIDER
+
+    def _catalogue(self):
+        """The discovery module matching this brain's provider."""
+        if self.provider == "local":
+            import SeeLocalModels
+            return SeeLocalModels
+        import SeeOpenRouterFreeModels
+        return SeeOpenRouterFreeModels
 
     def resolve_model(self) -> str:
         """Pick a live model, resolving the "auto" placeholder once.
@@ -306,9 +344,14 @@ Hacker Mode: ENGAGED.
 
         resolved = None
         try:
-            import SeeOpenRouterFreeModels as discovery
-            resolved = discovery.resolve_free_model()
+            discovery = self._catalogue()
+            if self.provider == "local":
+                resolved = discovery.resolve_local_model()
+            else:
+                resolved = discovery.resolve_free_model()
         except Exception:
+            # Discovery is best-effort: a catalogue failure leaves the
+            # placeholder in place and the caller reports it.
             resolved = None
 
         if resolved:
@@ -317,16 +360,26 @@ Hacker Mode: ENGAGED.
         return self.model
 
     def _switch_model(self, exclude: set) -> bool:
-        """Move to a different live free model. True if one was found."""
+        """Move to a different live model. True if one was found."""
         try:
-            import SeeOpenRouterFreeModels as discovery
-            candidates = [
-                m for m in discovery.list_free_models(force_refresh=True)
-                if m not in exclude
-            ]
-            if not candidates:
+            discovery = self._catalogue()
+            if self.provider == "local":
+                candidates = [
+                    m for m in discovery.list_local_models()
+                    if m not in exclude
+                ]
+                # Local models are already explicit, so any survivor is fine.
+                chosen = candidates[0] if candidates else None
+            else:
+                candidates = [
+                    m for m in discovery.list_free_models(force_refresh=True)
+                    if m not in exclude
+                ]
+                chosen = min(candidates, key=discovery._score) if candidates else None
+
+            if not chosen:
                 return False
-            self.model = min(candidates, key=discovery._score)
+            self.model = chosen
             self._resolved = True
             return True
         except Exception:
@@ -399,15 +452,23 @@ class App:
         # Set when the provider authenticated but no model could be chosen.
         self._no_model = False
 
+    def _sync_ui(self):
+        """Keep the UI's view of connection state and provider current."""
+        self.ui.connected = self._connected
+        self.ui.provider = Config.API_PROVIDER
+
     def _load_key(self) -> str:
         """Read the stored API key. Returns "" when none is configured."""
         load_dotenv(dotenv_path=Config.ENV_FILE)
         return os.getenv(Config.API_KEY_NAME) or ""
 
     def setup(self) -> bool:
-        """Verify the stored key and build the brain. Chat requires this."""
-        key = self._load_key()
-        if not key:
+        """Verify the provider and build the brain. Chat requires this."""
+        config = Config.get_provider_config() or {}
+
+        # Local (Ollama) needs no key: it is the free, offline path.
+        key = "" if not config.get("NEEDS_KEY", True) else self._load_key()
+        if config.get("NEEDS_KEY", True) and not key:
             return False
 
         try:
@@ -416,21 +477,12 @@ class App:
                 self.brain.client.models.list()
                 resolved = self.brain.resolve_model()
                 time.sleep(1)
-            # An unresolved "auto" means the free tier came back empty. Say
+            # An unresolved "auto" means the catalogue came back empty. Say
             # so here: staying silent sends the user into chat pinned to a
             # model that does not exist.
             self._no_model = resolved == Config.AUTO_MODEL
             if self._no_model:
-                self.ui.show_msg(
-                    "No Free Models",
-                    "Your key is valid, but OpenRouter is offering no free "
-                    "models right now.\n\n"
-                    "Nothing was pinned: HexSecGPT will not spend your money "
-                    "without you choosing to.\n"
-                    "Run 'python HexSecGPT.py --list-models' to see the live "
-                    "list, or pin one with --model <id>.",
-                    "yellow",
-                )
+                self._report_no_model()
             else:
                 self.ui.show_msg("Model", f"Active: {resolved}", "cyan")
             return True
@@ -438,8 +490,74 @@ class App:
             # Drop the half-built brain: run_chat() checks `self.brain`,
             # which would otherwise pass on a client that never verified.
             self.brain = None
-            self.ui.show_msg("Auth Failed", f"Key verification failed: {e}", "red")
+            if Config.API_PROVIDER == "local":
+                self.ui.show_msg(
+                    "Ollama Unreachable",
+                    f"Could not reach the local model server: {e}\n\n"
+                    "Start it with 'ollama serve', then pull a model:\n"
+                    "  ollama pull qwen2.5-coder:7b",
+                    "red",
+                )
+            else:
+                self.ui.show_msg("Auth Failed", f"Key verification failed: {e}", "red")
             return False
+
+    def _report_no_model(self):
+        """Explain an empty catalogue in terms the user can act on."""
+        if Config.API_PROVIDER == "local":
+            self.ui.show_msg(
+                "No Local Models",
+                "Ollama is running but has no chat model pulled.\n\n"
+                "Pull one to get started:\n"
+                "  ollama pull qwen2.5-coder:7b\n\n"
+                "Then choose [5] to switch back to Local.",
+                "yellow",
+            )
+            return
+        self.ui.show_msg(
+            "No Free Models",
+            "Your key is valid, but OpenRouter is offering no free "
+            "models right now.\n\n"
+            "Nothing was pinned: HexSecGPT will not spend your money "
+            "without you choosing to.\n"
+            "Run 'python HexSecGPT.py --list-models' to see the live "
+            "list, or pick a local model with option [5].",
+            "yellow",
+        )
+
+    def switch_provider(self) -> bool:
+        """Menu option [5]: change provider without restarting the app."""
+        names = sorted(Config.PROVIDERS)
+        self.ui.banner()
+        self.ui.console.print("[bold cyan]Select a provider[/]")
+        for index, name in enumerate(names, start=1):
+            marker = " [bold green](current)[/]" if name == Config.API_PROVIDER else ""
+            label = " (no key, free, offline)" if not Config.PROVIDERS[name].get(
+                "NEEDS_KEY", True) else ""
+            self.ui.console.print(f"  [yellow][{index}][/] {name}{label}{marker}")
+
+        try:
+            raw = self.ui.get_input("PROVIDER")
+        except (EOFError, KeyboardInterrupt):
+            return False
+
+        # Accept the bare name too, so a typed "local" is not a dead end.
+        chosen = raw.strip().lower()
+        if chosen.isdigit() and 1 <= int(chosen) <= len(names):
+            chosen = names[int(chosen) - 1]
+        if chosen not in Config.PROVIDERS:
+            self.ui.show_msg("Invalid", f"Unknown provider: {raw}", "red")
+            return False
+
+        Config.API_PROVIDER = chosen
+        # A pinned model from another provider is meaningless here; the
+        # per-provider catalogue resolves this one instead.
+        Config.PROVIDERS[chosen]["MODEL_NAME"] = Config.AUTO_MODEL
+        self.brain = None
+        connected = self.setup()
+        self._connected = connected
+        self._sync_ui()
+        return connected
 
     def configure_key(self) -> bool:
         self.ui.banner()
@@ -486,14 +604,23 @@ class App:
                 self.ui.console.print("\n[bold red]Interrupt Signal Received.[/]")
                 break
             if self.brain.model == Config.AUTO_MODEL:
-                self.ui.show_msg(
-                    "No Free Models",
-                    "The free tier is empty, so there is no model to switch to. "
-                    "HexSecGPT will not use a paid model without your say-so.\n"
-                    "Run 'python HexSecGPT.py --list-models' to check, or pin one "
-                    "with --model <id>.",
-                    "yellow",
-                )
+                if self.brain.provider == "local":
+                    self.ui.show_msg(
+                        "No Local Models",
+                        "Ollama has no usable model pulled, so there is "
+                        "nothing to switch to.\n"
+                        "Pull one with:  ollama pull qwen2.5-coder:7b",
+                        "yellow",
+                    )
+                else:
+                    self.ui.show_msg(
+                        "No Free Models",
+                        "The free tier is empty, so there is no model to switch to. "
+                        "HexSecGPT will not use a paid model without your say-so.\n"
+                        "Run 'python HexSecGPT.py --list-models' to check, or pick a "
+                        "local model with option [5].",
+                        "yellow",
+                    )
 
     def about(self):
         self.ui.banner()
@@ -504,6 +631,7 @@ class App:
 • Unfiltered responses
 • Markdown & Syntax Highlighting
 • Custom "Hacker" Persona
+• Local models via Ollama (no key, no cost)
 
 [bold green]Links:[/bold green]
 • GitHub: github.com/hexsecteam/HexSecGPT
@@ -517,7 +645,7 @@ class App:
         # configures a key in the first place, so gating the menu on a
         # working key would make it unreachable without one.
         self._connected = self.setup()
-        self.ui.connected = self._connected
+        self._sync_ui()
 
         while True:
             self.ui.banner()
@@ -526,18 +654,24 @@ class App:
 
             if choice == '1':
                 if not self._connected:
+                    needs_key = Config.get_provider_config().get("NEEDS_KEY", True)
                     self.ui.show_msg(
                         "Locked",
-                        "API Key required. Select [2] Configure Security Keys.",
+                        "API Key required. Select [2] Configure Security Keys."
+                        if needs_key else
+                        "No model available. Select [5] to choose a provider.",
                         "yellow",
                     )
                 else:
                     self.run_chat()
             elif choice == '2':
                 self._connected = self.configure_key()
-                self.ui.connected = self._connected
+                self._sync_ui()
             elif choice == '3':
                 self.about()
+            elif choice == '5':
+                self.switch_provider()
+                self._sync_ui()
             elif choice == '4':
                 self.ui.console.print("[bold red]Terminating connection...[/]")
                 time.sleep(0.5)
@@ -555,11 +689,17 @@ def main(argv=None) -> int:
     parser.add_argument("--model", help="pin a specific model id for this run")
     parser.add_argument("--list-models", action="store_true",
                         help="list currently-free models and exit")
+    parser.add_argument("--list-local-models", action="store_true",
+                        help="list models available via Ollama and exit")
     parser.add_argument("--provider", choices=sorted(Config.PROVIDERS),
                         help="override the API provider for this run")
     parser.add_argument("--upgrade", nargs="?", const="latest",
                         help="run the upgrade manager before starting")
     args = parser.parse_args(argv)
+
+    if args.list_local_models:
+        import SeeLocalModels
+        return SeeLocalModels.main([])
 
     if args.list_models:
         import SeeOpenRouterFreeModels as discovery
