@@ -123,6 +123,8 @@ class UI:
     
     def __init__(self):
         self.console = Console()
+        # Kept in sync with App._connected; set by App.start().
+        self.connected = False
     
     def clear(self):
         os.system('cls' if os.name == 'nt' else 'clear')
@@ -156,6 +158,10 @@ class UI:
         table.add_row("[2]", "Configure Security Keys (API Setup)")
         table.add_row("[3]", "System Manifesto (About)")
         table.add_row("[4]", "Terminate Session (Exit)")
+        if self.connected:
+            table.add_row("[*]", "[bold green]Status: Neural Link established[/]")
+        else:
+            table.add_row("[*]", "[bold yellow]Status: No API Key - option [1] requires [2][/]")
         
         panel = Panel(
             Align.center(table),
@@ -381,16 +387,17 @@ class App:
         self.ui = UI()
         self.brain = None
         self.model_override = model_override
+        self._connected = False
+
+    def _load_key(self) -> str:
+        """Read the stored API key. Returns "" when none is configured."""
+        load_dotenv(dotenv_path=Config.ENV_FILE)
+        return os.getenv(Config.API_KEY_NAME) or ""
 
     def setup(self) -> bool:
-        load_dotenv(dotenv_path=Config.ENV_FILE)
-        key = os.getenv(Config.API_KEY_NAME)
-
+        """Verify the stored key and build the brain. Chat requires this."""
+        key = self._load_key()
         if not key:
-            self.ui.banner()
-            self.ui.show_msg("Warning", "Encryption Key (API Key) not found.", "yellow")
-            if self.ui.get_input("Configure now? (y/n)").lower().startswith('y'):
-                return self.configure_key()
             return False
 
         try:
@@ -403,9 +410,10 @@ class App:
                 self.ui.show_msg("Model", f"Active: {resolved}", "cyan")
             return True
         except Exception as e:
+            # Drop the half-built brain: run_chat() checks `self.brain`,
+            # which would otherwise pass on a client that never verified.
+            self.brain = None
             self.ui.show_msg("Auth Failed", f"Key verification failed: {e}", "red")
-            if self.ui.get_input("Re-enter key? (y/n)").lower().startswith('y'):
-                return self.configure_key()
             return False
 
     def configure_key(self) -> bool:
@@ -471,19 +479,29 @@ class App:
         self.ui.get_input("Press Enter")
 
     def start(self):
-        if not self.setup():
-            self.ui.console.print("[red]System Halted: Authorization missing.[/]")
-            return
+        # The menu must render before any auth: option 2 is how a user
+        # configures a key in the first place, so gating the menu on a
+        # working key would make it unreachable without one.
+        self._connected = self.setup()
+        self.ui.connected = self._connected
 
         while True:
             self.ui.banner()
             self.ui.main_menu()
             choice = self.ui.get_input("MENU")
-            
+
             if choice == '1':
-                self.run_chat()
+                if not self._connected:
+                    self.ui.show_msg(
+                        "Locked",
+                        "API Key required. Select [2] Configure Security Keys.",
+                        "yellow",
+                    )
+                else:
+                    self.run_chat()
             elif choice == '2':
-                self.configure_key()
+                self._connected = self.configure_key()
+                self.ui.connected = self._connected
             elif choice == '3':
                 self.about()
             elif choice == '4':

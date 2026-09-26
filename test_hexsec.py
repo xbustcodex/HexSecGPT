@@ -432,6 +432,122 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 0)
         self.assertIn("--list-models", buf.getvalue())
 
+class TestStartupReachesMenuWithoutKey(unittest.TestCase):
+    """Option [2] sets the API key, so the menu must render without one.
+
+    The original startup gated the menu behind a verified key, which made
+    the very option that configures a key unreachable without one.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        # Point the key store at an empty temp file so the real .HexSec is
+        # never read or written.
+        real_env_file = app_mod.Config.ENV_FILE
+        app_mod.Config.ENV_FILE = os.path.join(self.tmp, ".HexSec")
+        self.addCleanup(setattr, app_mod.Config, "ENV_FILE", real_env_file)
+        # load_dotenv() writes into os.environ; a key from the developer's
+        # real environment would otherwise authenticate these tests.
+        for var in (app_mod.Config.API_KEY_NAME, "HEXSEC_MODEL"):
+            saved = os.environ.pop(var, None)
+            self.addCleanup(self._restore_env, var, saved)
+
+    @staticmethod
+    def _restore_env(var, value):
+        if value is None:
+            os.environ.pop(var, None)
+        else:
+            os.environ[var] = value
+
+    def _run_menu(self, choices):
+        """Drive App.start() with scripted input; return what each branch did."""
+        calls = {"menu": 0, "chat": 0, "about": 0, "configure": 0, "msgs": []}
+
+        saved = {name: getattr(app_mod.UI, name) for name in
+                 ("get_input", "main_menu", "show_msg", "banner")}
+        saved.update({name: getattr(app_mod.App, name) for name in
+                      ("about", "run_chat", "configure_key")})
+        self.addCleanup(self._restore_ui, saved)
+
+        app_mod.UI.banner = lambda self: None
+        app_mod.UI.main_menu = lambda self: calls.__setitem__("menu", calls["menu"] + 1)
+        app_mod.UI.show_msg = (
+            lambda self, title, content, color="white": calls["msgs"].append((title, content)))
+        app_mod.App.about = lambda self: calls.__setitem__("about", calls["about"] + 1)
+        app_mod.App.run_chat = lambda self: calls.__setitem__("chat", calls["chat"] + 1)
+        app_mod.App.configure_key = (
+            lambda self: calls.__setitem__("configure", calls["configure"] + 1) or False)
+
+        remaining = list(choices)
+        app_mod.UI.get_input = lambda self, label="COMMAND": remaining.pop(0) if remaining else "4"
+
+        with self.assertRaises(SystemExit):
+            app_mod.App().start()
+        return calls
+
+    @staticmethod
+    def _restore_ui(saved):
+        for name, value in saved.items():
+            owner = app_mod.App if hasattr(app_mod.App, name) else app_mod.UI
+            setattr(owner, name, value)
+
+    def test_menu_renders_with_no_key(self):
+        self.assertGreater(self._run_menu(["3", "", "4"])["menu"], 0)
+
+    def test_start_chat_is_refused_without_key(self):
+        calls = self._run_menu(["1", "3", "", "4"])
+        self.assertEqual(calls["chat"], 0, "run_chat ran without a key")
+        self.assertIn("Locked", [title for title, _ in calls["msgs"]])
+
+    def test_about_is_reachable_without_key(self):
+        self.assertEqual(self._run_menu(["3", "", "4"])["about"], 1)
+
+    def test_configure_keys_option_is_reachable_without_key(self):
+        calls = self._run_menu(["2", "3", "", "4"])
+        self.assertEqual(calls["configure"], 1,
+                         "option [2] never invoked configure_key()")
+
+    def test_failed_verification_leaves_no_brain(self):
+        """A brain that never authenticated must not survive for run_chat."""
+        real_load_key = app_mod.App._load_key
+        real_brain = app_mod.HexSecBrain
+        self.addCleanup(setattr, app_mod.App, "_load_key", real_load_key)
+        self.addCleanup(setattr, app_mod, "HexSecBrain", real_brain)
+        # A syntactically invalid key, chosen so this file stays clean
+        # under the repo's real-key secret scan.
+        app_mod.App._load_key = lambda self: "invalid-test-key"
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("401 unauthorized")
+
+        class FakeBrain:
+            def __init__(self, *args, **kwargs):
+                self.client = type("Client", (), {
+                    "models": type("Models", (), {"list": staticmethod(boom)})})()
+
+        app_mod.HexSecBrain = FakeBrain
+        app = app_mod.App()
+        self.assertFalse(app.setup())
+        self.assertIsNone(app.brain, "brain survived failed verification")
+
+    def test_menu_shows_connection_status_row(self):
+        from rich.console import Console
+        for connected, expected in ((False, "No API Key"),
+                                    (True, "Neural Link established")):
+            with self.subTest(connected=connected):
+                ui = app_mod.UI()
+                ui.connected = connected
+                buf = io.StringIO()
+                real_console = ui.console
+                ui.console = Console(file=buf, width=200, force_terminal=False,
+                                     no_color=True, legacy_windows=False)
+                try:
+                    ui.main_menu()
+                finally:
+                    ui.console = real_console
+                self.assertIn(expected, buf.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
