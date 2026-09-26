@@ -143,11 +143,19 @@ class UI:
 
         tagline = Text("SYSTEM: UNRESTRICTED | PROTOCOL: ACTIVE", style="bold red blink")
         subline = Text("Developed Telegram: hexsec_tools", style="dim green")
-        
+        # State plainly what this is, so nobody mistakes it for a
+        # self-hosted model: it is a client for someone else's API.
+        disclaimer = Text(
+            "Unofficial wrapper using third-party LLM APIs "
+            "(OpenRouter / DeepSeek). Not the HexSecTeam private model.",
+            style="dim yellow",
+        )
+
         self.console.print(Align.center(ascii_art))
         self.console.print(Align.center(tagline))
         self.console.print(Align.center(subline))
-        self.console.print(Panel("", border_style="green", height=1)) 
+        self.console.print(Align.center(disclaimer))
+        self.console.print(Panel("", border_style="green", height=1))
 
     def main_menu(self):
         table = Table(show_header=False, box=None, padding=(0, 2))
@@ -388,6 +396,8 @@ class App:
         self.brain = None
         self.model_override = model_override
         self._connected = False
+        # Set when the provider authenticated but no model could be chosen.
+        self._no_model = False
 
     def _load_key(self) -> str:
         """Read the stored API key. Returns "" when none is configured."""
@@ -406,7 +416,22 @@ class App:
                 self.brain.client.models.list()
                 resolved = self.brain.resolve_model()
                 time.sleep(1)
-            if resolved and resolved != Config.AUTO_MODEL:
+            # An unresolved "auto" means the free tier came back empty. Say
+            # so here: staying silent sends the user into chat pinned to a
+            # model that does not exist.
+            self._no_model = resolved == Config.AUTO_MODEL
+            if self._no_model:
+                self.ui.show_msg(
+                    "No Free Models",
+                    "Your key is valid, but OpenRouter is offering no free "
+                    "models right now.\n\n"
+                    "Nothing was pinned: HexSecGPT will not spend your money "
+                    "without you choosing to.\n"
+                    "Run 'python HexSecGPT.py --list-models' to see the live "
+                    "list, or pin one with --model <id>.",
+                    "yellow",
+                )
+            else:
                 self.ui.show_msg("Model", f"Active: {resolved}", "cyan")
             return True
         except Exception as e:
@@ -460,6 +485,15 @@ class App:
             except KeyboardInterrupt:
                 self.ui.console.print("\n[bold red]Interrupt Signal Received.[/]")
                 break
+            if self.brain.model == Config.AUTO_MODEL:
+                self.ui.show_msg(
+                    "No Free Models",
+                    "The free tier is empty, so there is no model to switch to. "
+                    "HexSecGPT will not use a paid model without your say-so.\n"
+                    "Run 'python HexSecGPT.py --list-models' to check, or pin one "
+                    "with --model <id>.",
+                    "yellow",
+                )
 
     def about(self):
         self.ui.banner()

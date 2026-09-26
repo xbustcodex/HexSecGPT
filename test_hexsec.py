@@ -548,6 +548,77 @@ class TestStartupReachesMenuWithoutKey(unittest.TestCase):
                     ui.console = real_console
                 self.assertIn(expected, buf.getvalue())
 
+    def test_valid_key_with_no_free_model_is_reported(self):
+        """A key that verifies but resolves to 'auto' must say so, not chat."""
+        msgs = []
+        app = app_mod.App()
+        real_show = app_mod.UI.show_msg
+        self.addCleanup(setattr, app_mod.UI, "show_msg", real_show)
+        app_mod.UI.show_msg = (
+            lambda self, title, content, color="white": msgs.append((title, content)))
+
+        class FakeBrain:
+            def __init__(self, *a, **k):
+                self.client = type("Client", (), {
+                    "models": type("Models", (), {"list": staticmethod(lambda: None)})})()
+                self.model = app_mod.Config.AUTO_MODEL
+
+            def resolve_model(self):
+                return app_mod.Config.AUTO_MODEL
+
+        real_load_key = app_mod.App._load_key
+        real_brain = app_mod.HexSecBrain
+        real_sleep = app_mod.time.sleep
+        self.addCleanup(setattr, app_mod.App, "_load_key", real_load_key)
+        self.addCleanup(setattr, app_mod, "HexSecBrain", real_brain)
+        self.addCleanup(setattr, app_mod.time, "sleep", real_sleep)
+        app_mod.App._load_key = lambda self: "valid-key"
+        app_mod.HexSecBrain = FakeBrain
+        app_mod.time.sleep = lambda s: None
+
+        self.assertTrue(app.setup())
+        self.assertTrue(app._no_model)
+        titles = [t for t, _ in msgs]
+        self.assertIn("No Free Models", titles)
+        self.assertNotIn("Model", titles, "printed a bogus active model")
+        body = dict(msgs)["No Free Models"]
+        self.assertIn("--list-models", body)
+
+    def test_chat_explains_empty_free_tier_after_failed_switch(self):
+        """Hitting a dead model must explain the empty tier, not fail mute."""
+        msgs = []
+        app = app_mod.App()
+        real_show = app_mod.UI.show_msg
+        real_banner = app_mod.UI.banner
+        real_stream = app_mod.UI.stream_markdown
+        real_get_input = app_mod.UI.get_input
+        self.addCleanup(setattr, app_mod.UI, "show_msg", real_show)
+        self.addCleanup(setattr, app_mod.UI, "banner", real_banner)
+        self.addCleanup(setattr, app_mod.UI, "stream_markdown", real_stream)
+        self.addCleanup(setattr, app_mod.UI, "get_input", real_get_input)
+        app_mod.UI.banner = lambda self: None
+        app_mod.UI.stream_markdown = lambda self, title, gen: list(gen)
+        app_mod.UI.show_msg = (
+            lambda self, title, content, color="white": msgs.append((title, content)))
+
+        class DeadBrain:
+            model = app_mod.Config.AUTO_MODEL
+
+            def chat(self, prompt):
+                yield "Error: Connection Terminated. Reason: model_not_found"
+
+            def _switch_model(self, exclude):
+                return False
+
+        app.brain = DeadBrain()
+        inputs = iter(["hello", "/exit"])
+        app_mod.UI.get_input = lambda self, label="COMMAND": next(inputs)
+        app.run_chat()
+        titles = [t for t, _ in msgs]
+        self.assertIn("No Free Models", titles,
+                      "empty free tier was not explained after a dead model")
+        self.assertIn("will not use a paid model", dict(msgs)["No Free Models"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
